@@ -1,8 +1,86 @@
-import json
 from dataclasses import dataclass
 from typing import List
 from web3 import Web3
 from eth_keys import keys
+from Crypto.Cipher import AES
+from binascii import unhexlify
+import json
+
+class Aes128Encryptor:
+    def __init__(self, key_bytes: bytes):
+        if len(key_bytes) != 16:
+            raise ValueError("AES-128 key must be 16 bytes.")
+        self.key = key_bytes
+        self.ecb_cipher = AES.new(self.key, AES.MODE_ECB)
+
+    @staticmethod
+    def from_hex(hex_key: str):
+        return Aes128Encryptor(unhexlify(hex_key))
+
+    def encrypt_block(self, input_bytes: bytes) -> bytes:
+        if len(input_bytes) != 16:
+            raise ValueError("ECB block encrypt requires 16 bytes input.")
+        return self.ecb_cipher.encrypt(input_bytes)
+
+    def compute_continuous_counters(self, nonce_bytes: bytes, total_length: int) -> bytes:
+        result = bytearray()
+        nonce_index = bytearray(4)  # start at 0x00000000
+
+        def incr_nonce(buf: bytearray):
+            for i in reversed(range(4)):
+                if buf[i] == 0xFF:
+                    buf[i] = 0
+                else:
+                    buf[i] += 1
+                    break
+
+        incr_nonce(nonce_index)  # initial increment to match JS
+
+        while len(result) < total_length:
+            incr_nonce(nonce_index)
+            full_nonce = nonce_bytes + nonce_index
+            encrypted = self.encrypt_block(full_nonce)
+            result.extend(encrypted)
+
+        return bytes(result[:total_length])
+
+class TLSRecord:
+    def __init__(self, ciphertext: str, nonce: str, json_block_positions):
+        self.ciphertext = ciphertext  # hex string
+        self.nonce = nonce            # hex string
+        self.json_block_positions = json_block_positions  # list of [start, end]
+
+class HTTPPacket:
+    def __init__(self, records: list):
+        self.records = records
+
+class TLSData:
+    def __init__(self, packets: list):
+        self.packets = packets
+
+    def get_full_plain_response(self, aes_key_hex: str) -> list:
+        cipher = Aes128Encryptor.from_hex(aes_key_hex)
+        responses = []
+
+        for packet in self.packets:
+            response = b''
+
+            for record in packet.records:
+                nonce_bytes = unhexlify(record.nonce)
+                ciphertext_bytes = unhexlify(record.ciphertext)
+                counters = cipher.compute_continuous_counters(nonce_bytes, len(ciphertext_bytes))
+                plain_bytes = bytes([a ^ b for a, b in zip(counters, ciphertext_bytes)])
+                response += plain_bytes
+
+            try:
+                decoded = response.decode('utf-8')
+                responses.append(decoded)
+            except UnicodeDecodeError:
+                responses.append(response.hex())
+
+        return responses
+
+
 
 @dataclass
 class AttNetworkRequest:
@@ -135,10 +213,31 @@ def recover_address(hash_hex: str, signature: str) -> str:
     pubkey = sig_obj.recover_public_key_from_msg_hash(message_hash)
     return pubkey.to_checksum_address()
 
+
+def extract_data_from_http_response(http_response: str):
+    # Split headers and body
+    split_parts = http_response.split("\r\n\r\n")
+    if len(split_parts) == 1:
+        split_parts = http_response.split("\n\n")
+
+    raw_json_body = split_parts[-1].strip()
+
+    try:
+        parsed = json.loads(raw_json_body)
+        if "data" not in parsed:
+            raise ValueError("'data' field not found in response JSON.")
+        return parsed["data"]
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse JSON body: {e}")
+
+
 def main():
-    # Read attestation from json file
-    with open('attestation.json', 'r', encoding='utf-8') as f:
+    # Read attestation from json file (will be passed from the FE)
+    with open('attestation_binance.json', 'r', encoding='utf-8') as f:
         attestation_dict = json.load(f)
+    # The aesKey (will be passed from the FE)
+    aes_key="cf61e11b13d4456d715eac25b71e068f"
+
     # convert to object
     request = AttNetworkRequest(**attestation_dict['request'])
     reponse_resolve = [AttNetworkResponseResolve(**r) for r in attestation_dict['reponseResolve']]
@@ -159,7 +258,41 @@ def main():
     print("attestationSignature:", attestation.signatures[0][2:])
     signer = recover_address(attestation_hash, attestation.signatures[0][2:])
     print("signer is:", signer)
-    print("verify result:" ,signer.lower()=="0xDB736B13E2f522dBE18B2015d0291E4b193D8eF6".lower())
+    verify_result = signer.lower()=="0xDB736B13E2f522dBE18B2015d0291E4b193D8eF6".lower()
+    print("verify result:" , verify_result)
+
+    if verify_result is not True:
+        print("Attestation verification failed.")
+        return
+
+    url = attestation.request.url
+    if not (
+            url.startswith("https://www.binance.com/bapi/composite/v1/private/bigdata/finance/spot-statistics") or
+            url.startswith("https://www.binance.com/bapi/capital/v1/private/streamer/trade/get-user-trades") or
+            url.startswith("https://www.okx.com/priapi/v5/account/bills-archive")
+    ):
+        print("not support url")
+        return
+
+    data = json.loads(attestation.data)
+    parsed = json.loads(data["CompleteHttpResponseCiphertext"])
+
+    packets = []
+    for pkt in parsed["packets"]:
+        records = [
+            TLSRecord(
+                ciphertext=rec["ciphertext"],
+                nonce=rec["nonce"],
+                json_block_positions=rec["json_block_positions"]
+            ) for rec in pkt["records"]
+        ]
+        packets.append(HTTPPacket(records))
+
+    tls_data = TLSData(packets)
+    full_plain_response = tls_data.get_full_plain_response(aes_key)
+    data = extract_data_from_http_response(full_plain_response[0])
+    print("Extracted Data:\n"+json.dumps(data, indent=2))
+
 
 if __name__ == "__main__":
     main()
