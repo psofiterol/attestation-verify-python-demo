@@ -24,6 +24,7 @@ This project demonstrates how to encode, sign, and verify Ethereum-style attesta
    - Edit or replace `attestation.json` with your attestation data(signed by primuslabs).
 
 2. **Run the demo:**
+- Run demo to verify attestation:
    ```bash
    python3 attestation_sign.py
    ```
@@ -32,3 +33,11 @@ This project demonstrates how to encode, sign, and verify Ethereum-style attesta
    - Encode the attestation
    - Attempt to recover the signer address from the signature
    - Compare the recovered signer address with the expected signer address
+
+- Run demo to sign an app signature and verify it:
+  ```bash
+  python3 app_sign_and_verify.py
+  ```
+  This will:
+  - Generate an app signature with app secret key
+  - Verify the app signature
